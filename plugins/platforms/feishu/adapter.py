@@ -1507,6 +1507,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        self._history_backfill_task: Optional[asyncio.Task] = None
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1765,10 +1766,11 @@ class FeishuAdapter(BasePlatformAdapter):
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             if not is_reconnect:
-                asyncio.create_task(
-                    self._backfill_all_group_histories(),
-                    name="feishu-history-backfill",
-                )
+                if self._history_backfill_task is None or self._history_backfill_task.done():
+                    self._history_backfill_task = asyncio.create_task(
+                        self._backfill_all_group_histories(),
+                        name="feishu-history-backfill",
+                    )
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -1780,6 +1782,11 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        history_task = self._history_backfill_task
+        self._history_backfill_task = None
+        if history_task and not history_task.done():
+            history_task.cancel()
+            await asyncio.gather(history_task, return_exceptions=True)
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()

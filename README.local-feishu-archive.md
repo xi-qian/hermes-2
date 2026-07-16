@@ -35,3 +35,7 @@ systemctl restart hermes-gateway
 The tool accepts an optional keyword, ISO-8601 `after` / `before` bounds, and a
 limit of up to 30 messages. It derives the chat ID from the active Feishu group
 session, so a model cannot use it to retrieve another group's archive.
+
+When called from the configured `FEISHU_HOME_CHANNEL`, the tool may search all
+archived group histories or select a specific group with `chat_id`. Other
+conversations remain restricted to their own archive.

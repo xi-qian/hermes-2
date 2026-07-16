@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -12,7 +13,7 @@ from hermes_constants import get_hermes_home
 from tools.registry import tool_error, tool_result
 
 
-_GROUP_SESSION_RE = re.compile(r"(?:^|:)feishu:group:(oc_[^:]+)")
+_FEISHU_SESSION_RE = re.compile(r"(?:^|:)feishu:(?:group|dm):(oc_[^:]+)")
 _MAX_LIMIT = 30
 _MAX_CONTENT_CHARS = 1_200
 
@@ -28,6 +29,13 @@ FEISHU_CONTEXT_SEARCH_SCHEMA = {
             "query": {
                 "type": "string",
                 "description": "Optional keyword or phrase to find in archived message content.",
+            },
+            "chat_id": {
+                "type": "string",
+                "description": (
+                    "Optional group chat ID. Only the configured Feishu home channel can "
+                    "use this to select another group's archive."
+                ),
             },
             "after": {
                 "type": "string",
@@ -54,8 +62,8 @@ def _check_archive_available() -> bool:
     return (get_hermes_home() / "feishu_messages.db").is_file()
 
 
-def _current_group_chat_id(session_id: str) -> str:
-    match = _GROUP_SESSION_RE.search(session_id or "")
+def _current_chat_id(session_id: str) -> str:
+    match = _FEISHU_SESSION_RE.search(session_id or "")
     return match.group(1) if match else ""
 
 
@@ -75,9 +83,18 @@ def _short_content(value: Any) -> str:
 
 
 def _search_current_group(args: dict, *, session_id: str = "", **_: Any) -> str:
-    chat_id = _current_group_chat_id(session_id)
-    if not chat_id:
-        return tool_error("feishu_context_search is available only from a Feishu group conversation.")
+    current_chat_id = _current_chat_id(session_id)
+    if not current_chat_id:
+        return tool_error("feishu_context_search is available only from a Feishu conversation.")
+
+    home_channel = os.getenv("FEISHU_HOME_CHANNEL", "").strip()
+    requested_chat_id = str(args.get("chat_id") or "").strip()
+    is_home_channel = bool(home_channel and current_chat_id == home_channel)
+    if requested_chat_id and not is_home_channel and requested_chat_id != current_chat_id:
+        return tool_error("Only the configured Feishu home channel may query another group's archive.")
+
+    search_all_groups = is_home_channel and not requested_chat_id
+    chat_id = requested_chat_id or current_chat_id
 
     archive_path = get_hermes_home() / "feishu_messages.db"
     if not archive_path.is_file():
@@ -90,9 +107,13 @@ def _search_current_group(args: dict, *, session_id: str = "", **_: Any) -> str:
     sql = [
         "SELECT message_id, received_at, create_time, sender_open_id, message_type, content, mentioned_bot",
         "FROM feishu_messages",
-        "WHERE chat_id = ?",
     ]
-    params: list[Any] = [chat_id]
+    params: list[Any] = []
+    if search_all_groups:
+        sql.append("WHERE chat_type <> 'p2p'")
+    else:
+        sql.append("WHERE chat_id = ?")
+        params.append(chat_id)
     if query:
         sql.append("AND content LIKE ?")
         params.append(f"%{query}%")
@@ -139,7 +160,8 @@ def _search_current_group(args: dict, *, session_id: str = "", **_: Any) -> str:
     return tool_result(
         {
             "success": True,
-            "chat_id": chat_id,
+            "scope": "all_groups" if search_all_groups else "current_group",
+            "chat_id": None if search_all_groups else chat_id,
             "count": len(messages),
             "messages": messages,
         }
