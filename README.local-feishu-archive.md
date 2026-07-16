@@ -8,6 +8,8 @@ session data, and the archived Feishu messages themselves.
 
 - `plugins/platforms/feishu/adapter.py` archives every Feishu event delivered to
   the bot into `/root/.hermes/feishu_messages.db` before agent admission.
+- On startup it discovers visible group chats and backfills their accessible
+  history; joining a later group triggers that group's backfill as well.
 - Unmentioned group messages and their attachments are archived but do not call
   the model or receive a reply.
 - Attachments are copied to `/root/.hermes/feishu_attachments/<message-id>/`.

@@ -100,6 +100,8 @@ try:
         GetChatRequest,
         GetMessageRequest,
         GetMessageResourceRequest,
+        ListChatRequest,
+        ListMessageRequest,
         P2ImMessageMessageReadV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
@@ -203,6 +205,8 @@ _DEFAULT_DEDUP_CACHE_SIZE = 2048
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
+_FEISHU_HISTORY_PAGE_SIZE = 50
+_FEISHU_HISTORY_MAX_PAGES = 100
 # ---------------------------------------------------------------------------
 # TTL, rate-limit and webhook security constants
 # ---------------------------------------------------------------------------
@@ -1377,6 +1381,7 @@ def check_feishu_requirements() -> bool:
             CreateImageRequest, CreateImageRequestBody,
             CreateMessageRequest, CreateMessageRequestBody,
             GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+            ListChatRequest, ListMessageRequest,
             P2ImMessageMessageReadV1,
             ReplyMessageRequest, ReplyMessageRequestBody,
             UpdateMessageRequest, UpdateMessageRequestBody,
@@ -1401,6 +1406,8 @@ def check_feishu_requirements() -> bool:
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
+            "ListChatRequest": ListChatRequest,
+            "ListMessageRequest": ListMessageRequest,
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
@@ -1757,6 +1764,11 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+            if not is_reconnect:
+                asyncio.create_task(
+                    self._backfill_all_group_histories(),
+                    name="feishu-history-backfill",
+                )
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -2547,6 +2559,154 @@ class FeishuAdapter(BasePlatformAdapter):
         except sqlite3.Error:
             logger.exception("[Feishu] Failed to archive message %s", message_id)
 
+    @staticmethod
+    def _archive_has_message(message_id: str) -> bool:
+        """Return whether a history item is already persisted locally."""
+        archive_path = get_hermes_home() / "feishu_messages.db"
+        if not archive_path.is_file():
+            return False
+        try:
+            with sqlite3.connect(f"file:{archive_path}?mode=ro", uri=True) as conn:
+                return conn.execute(
+                    "SELECT 1 FROM feishu_messages WHERE message_id = ? LIMIT 1",
+                    (message_id,),
+                ).fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    @staticmethod
+    def _history_item_to_event(item: Any, chat_id: str) -> tuple[Any, Any]:
+        """Adapt a ListMessage response item to the inbound archive shape."""
+        sender = getattr(item, "sender", None)
+        sender_value = str(getattr(sender, "id", "") or "")
+        sender_type = str(getattr(sender, "id_type", "") or "")
+        sender_id = SimpleNamespace(
+            open_id=sender_value if sender_type == "open_id" else "",
+            user_id=sender_value if sender_type == "user_id" else "",
+            union_id=sender_value if sender_type == "union_id" else "",
+        )
+        mentions = []
+        for mention in getattr(item, "mentions", None) or []:
+            mention_value = str(getattr(mention, "id", "") or "")
+            mention_type = str(getattr(mention, "id_type", "") or "")
+            mentions.append(
+                SimpleNamespace(
+                    id=SimpleNamespace(
+                        open_id=mention_value if mention_type == "open_id" else "",
+                        user_id=mention_value if mention_type == "user_id" else "",
+                    ),
+                    name=str(getattr(mention, "name", "") or ""),
+                )
+            )
+        body = getattr(item, "body", None)
+        message = SimpleNamespace(
+            message_id=str(getattr(item, "message_id", "") or ""),
+            create_time=str(getattr(item, "create_time", "") or ""),
+            chat_id=str(getattr(item, "chat_id", "") or chat_id),
+            chat_type="group",
+            message_type=str(getattr(item, "msg_type", "") or ""),
+            content=str(getattr(body, "content", "") or ""),
+            mentions=mentions,
+        )
+        return message, SimpleNamespace(sender_id=sender_id)
+
+    async def _backfill_all_group_histories(self) -> None:
+        """Discover visible group chats and backfill each history in the background."""
+        if not self._client or "ListChatRequest" not in globals():
+            return
+        page_token = ""
+        chat_ids: list[str] = []
+        for _ in range(_FEISHU_HISTORY_MAX_PAGES):
+            request = ListChatRequest.builder().page_size(50)
+            if page_token:
+                request = request.page_token(page_token)
+            try:
+                response = await self._run_blocking(self._client.im.v1.chat.list, request.build())
+            except Exception:
+                logger.warning("[Feishu] Failed to list chats for history backfill", exc_info=True)
+                return
+            if not response or not response.success():
+                logger.warning(
+                    "[Feishu] Cannot list chats for history backfill: [%s] %s",
+                    getattr(response, "code", "unknown"),
+                    getattr(response, "msg", "unknown error"),
+                )
+                return
+            data = getattr(response, "data", None)
+            for chat in getattr(data, "items", None) or []:
+                chat_id = str(getattr(chat, "chat_id", "") or "")
+                # P2P entries identify their peer; groups do not.
+                if chat_id and not getattr(chat, "p2p_target_id", None):
+                    chat_ids.append(chat_id)
+            if not getattr(data, "has_more", False):
+                break
+            page_token = str(getattr(data, "page_token", "") or "")
+            if not page_token:
+                break
+        for chat_id in dict.fromkeys(chat_ids):
+            await self._backfill_chat_history(chat_id)
+
+    async def _backfill_chat_history(self, chat_id: str) -> None:
+        """Page through one group's visible history and archive unseen messages."""
+        if not self._client or not chat_id or "ListMessageRequest" not in globals():
+            return
+        page_token = ""
+        fetched = 0
+        archived = 0
+        for page_number in range(_FEISHU_HISTORY_MAX_PAGES):
+            request = (
+                ListMessageRequest.builder()
+                .container_id_type("chat")
+                .container_id(chat_id)
+                .sort_type("ByCreateTimeDesc")
+                .page_size(_FEISHU_HISTORY_PAGE_SIZE)
+            )
+            if page_token:
+                request = request.page_token(page_token)
+            try:
+                response = await self._run_blocking(self._client.im.v1.message.list, request.build())
+            except Exception:
+                logger.warning("[Feishu] History backfill failed for chat %s", chat_id, exc_info=True)
+                return
+            if not response or not response.success():
+                logger.warning(
+                    "[Feishu] Cannot read history for chat %s: [%s] %s",
+                    chat_id,
+                    getattr(response, "code", "unknown"),
+                    getattr(response, "msg", "unknown error"),
+                )
+                return
+            data = getattr(response, "data", None)
+            for item in getattr(data, "items", None) or []:
+                message_id = str(getattr(item, "message_id", "") or "")
+                fetched += 1
+                if not message_id or self._archive_has_message(message_id):
+                    continue
+                message, sender = self._history_item_to_event(item, chat_id)
+                await self._archive_inbound_message(
+                    message=message,
+                    sender=sender,
+                    mentioned_bot=self._mentions_self(message),
+                )
+                archived += 1
+            if not getattr(data, "has_more", False):
+                break
+            page_token = str(getattr(data, "page_token", "") or "")
+            if not page_token:
+                break
+            if page_number == _FEISHU_HISTORY_MAX_PAGES - 1:
+                logger.warning(
+                    "[Feishu] History backfill for chat %s reached the %d-page safety limit",
+                    chat_id,
+                    _FEISHU_HISTORY_MAX_PAGES,
+                )
+        logger.info(
+            "[Feishu] History backfill complete for chat %s: fetched=%d archived=%d",
+            chat_id,
+            fetched,
+            archived,
+        )
+
     def _on_message_event(self, data: Any) -> None:
         """Normalize Feishu inbound events into MessageEvent.
 
@@ -2738,6 +2898,9 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = str(getattr(event, "chat_id", "") or "")
         logger.info("[Feishu] Bot added to chat: %s", chat_id)
         self._chat_info_cache.pop(chat_id, None)
+        loop = self._loop
+        if chat_id and self._loop_accepts_callbacks(loop):
+            self._submit_on_loop(loop, self._backfill_chat_history(chat_id))
 
     def _on_bot_removed_from_chat(self, data: Any) -> None:
         """Handle bot being removed from a group chat."""
