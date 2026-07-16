@@ -5,3 +5,4 @@ author: "Local"
 kind: standalone
 provides_tools:
   - feishu_context_search
+  - feishu_history_pull

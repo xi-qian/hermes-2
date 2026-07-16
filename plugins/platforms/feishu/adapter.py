@@ -1765,7 +1765,7 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
-            if not is_reconnect:
+            if not is_reconnect and self._history_sync_enabled():
                 if self._history_backfill_task is None or self._history_backfill_task.done():
                     self._history_backfill_task = asyncio.create_task(
                         self._backfill_all_group_histories(),
@@ -2582,6 +2582,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
 
     @staticmethod
+    def _history_sync_enabled() -> bool:
+        return os.getenv("FEISHU_HISTORY_SYNC", "true").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+
+    @staticmethod
     def _history_item_to_event(item: Any, chat_id: str) -> tuple[Any, Any]:
         """Adapt a ListMessage response item to the inbound archive shape."""
         sender = getattr(item, "sender", None)
@@ -2653,10 +2659,16 @@ class FeishuAdapter(BasePlatformAdapter):
         for chat_id in dict.fromkeys(chat_ids):
             await self._backfill_chat_history(chat_id)
 
-    async def _backfill_chat_history(self, chat_id: str) -> None:
+    async def _backfill_chat_history(
+        self,
+        chat_id: str,
+        *,
+        start_time: str = "",
+        end_time: str = "",
+    ) -> Dict[str, Any]:
         """Page through one group's visible history and archive unseen messages."""
         if not self._client or not chat_id or "ListMessageRequest" not in globals():
-            return
+            return {"success": False, "error": "Feishu history client is unavailable"}
         page_token = ""
         fetched = 0
         archived = 0
@@ -2670,11 +2682,15 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             if page_token:
                 request = request.page_token(page_token)
+            if start_time:
+                request = request.start_time(start_time)
+            if end_time:
+                request = request.end_time(end_time)
             try:
                 response = await self._run_blocking(self._client.im.v1.message.list, request.build())
             except Exception:
                 logger.warning("[Feishu] History backfill failed for chat %s", chat_id, exc_info=True)
-                return
+                return {"success": False, "chat_id": chat_id, "error": "Feishu history request failed"}
             if not response or not response.success():
                 logger.warning(
                     "[Feishu] Cannot read history for chat %s: [%s] %s",
@@ -2682,7 +2698,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     getattr(response, "code", "unknown"),
                     getattr(response, "msg", "unknown error"),
                 )
-                return
+                return {
+                    "success": False,
+                    "chat_id": chat_id,
+                    "error": str(getattr(response, "msg", "Feishu rejected the history request")),
+                    "code": getattr(response, "code", None),
+                }
             data = getattr(response, "data", None)
             for item in getattr(data, "items", None) or []:
                 message_id = str(getattr(item, "message_id", "") or "")
@@ -2713,6 +2734,14 @@ class FeishuAdapter(BasePlatformAdapter):
             fetched,
             archived,
         )
+        return {
+            "success": True,
+            "chat_id": chat_id,
+            "fetched": fetched,
+            "archived": archived,
+            "start_time": start_time or None,
+            "end_time": end_time or None,
+        }
 
     def _on_message_event(self, data: Any) -> None:
         """Normalize Feishu inbound events into MessageEvent.
@@ -2906,7 +2935,7 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Bot added to chat: %s", chat_id)
         self._chat_info_cache.pop(chat_id, None)
         loop = self._loop
-        if chat_id and self._loop_accepts_callbacks(loop):
+        if chat_id and self._history_sync_enabled() and self._loop_accepts_callbacks(loop):
             self._submit_on_loop(loop, self._backfill_chat_history(chat_id))
 
     def _on_bot_removed_from_chat(self, data: Any) -> None:

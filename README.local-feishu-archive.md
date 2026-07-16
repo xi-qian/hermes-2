@@ -10,6 +10,8 @@ session data, and the archived Feishu messages themselves.
   the bot into `/root/.hermes/feishu_messages.db` before agent admission.
 - On startup it discovers visible group chats and backfills their accessible
   history; joining a later group triggers that group's backfill as well.
+- Set `FEISHU_HISTORY_SYNC=false` in `/root/.hermes/.env` to stop further
+  startup and new-group history backfills while continuing real-time archiving.
 - Unmentioned group messages and their attachments are archived but do not call
   the model or receive a reply.
 - Attachments are copied to `/root/.hermes/feishu_attachments/<message-id>/`.
@@ -39,3 +41,8 @@ session, so a model cannot use it to retrieve another group's archive.
 When called from the configured `FEISHU_HOME_CHANNEL`, the tool may search all
 archived group histories or select a specific group with `chat_id`. Other
 conversations remain restricted to their own archive.
+
+The home channel also has `feishu_history_pull` for manual, targeted imports.
+It requires `chat_id` and accepts optional `start_time` / `end_time` values as
+Unix seconds or ISO-8601 times. Automatic backfill remains disabled when
+`FEISHU_HISTORY_SYNC=false` is set.

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,29 @@ FEISHU_CONTEXT_SEARCH_SCHEMA = {
     },
 }
 
+FEISHU_HISTORY_PULL_SCHEMA = {
+    "name": "feishu_history_pull",
+    "description": (
+        "Fetch a specified Feishu group's accessible history into the local archive. "
+        "Only the configured Feishu home channel may use this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {"type": "string", "description": "Required Feishu group chat ID (oc_...)."},
+            "start_time": {
+                "type": "string",
+                "description": "Optional inclusive start, as Unix seconds or ISO-8601 time.",
+            },
+            "end_time": {
+                "type": "string",
+                "description": "Optional exclusive end, as Unix seconds or ISO-8601 time.",
+            },
+        },
+        "required": ["chat_id"],
+    },
+}
+
 
 def _check_archive_available() -> bool:
     return (get_hermes_home() / "feishu_messages.db").is_file()
@@ -80,6 +104,21 @@ def _short_content(value: Any) -> str:
     if len(text) <= _MAX_CONTENT_CHARS:
         return text
     return text[:_MAX_CONTENT_CHARS] + "... [truncated]"
+
+
+def _to_feishu_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return raw
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("time must be Unix seconds or ISO-8601") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return str(int(parsed.timestamp()))
 
 
 def _search_current_group(args: dict, *, session_id: str = "", **_: Any) -> str:
@@ -168,6 +207,40 @@ def _search_current_group(args: dict, *, session_id: str = "", **_: Any) -> str:
     )
 
 
+async def _pull_history(args: dict, *, session_id: str = "", **_: Any) -> str:
+    current_chat_id = _current_chat_id(session_id)
+    home_channel = os.getenv("FEISHU_HOME_CHANNEL", "").strip()
+    if not home_channel or current_chat_id != home_channel:
+        return tool_error("feishu_history_pull may only be called from the configured Feishu home channel.")
+    chat_id = str(args.get("chat_id") or "").strip()
+    if not chat_id.startswith("oc_"):
+        return tool_error("chat_id must be a Feishu group ID beginning with 'oc_'.")
+    try:
+        start_time = _to_feishu_timestamp(args.get("start_time"))
+        end_time = _to_feishu_timestamp(args.get("end_time"))
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    try:
+        import lark_oapi as lark
+        from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(enabled=True))
+        domain = LARK_DOMAIN if os.getenv("FEISHU_DOMAIN", "feishu").strip().lower() == "lark" else FEISHU_DOMAIN
+        adapter._client = adapter._build_lark_client(domain)
+        result = await adapter._backfill_chat_history(
+            chat_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        adapter._shutdown_sdk_executor()
+        return tool_result(result)
+    except Exception as exc:
+        return tool_error(f"Feishu history pull failed: {type(exc).__name__}: {exc}")
+
+
 def register(ctx) -> None:
     ctx.register_tool(
         name="feishu_context_search",
@@ -176,4 +249,13 @@ def register(ctx) -> None:
         handler=_search_current_group,
         check_fn=_check_archive_available,
         emoji="🗂️",
+    )
+    ctx.register_tool(
+        name="feishu_history_pull",
+        toolset="feishu_context",
+        schema=FEISHU_HISTORY_PULL_SCHEMA,
+        handler=_pull_history,
+        check_fn=_check_archive_available,
+        is_async=True,
+        emoji="⬇️",
     )
