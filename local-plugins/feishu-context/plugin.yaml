@@ -1,0 +1,7 @@
+name: feishu-context
+version: 1.0.0
+description: "Read-only, current-group search over locally archived Feishu messages and attachments."
+author: "Local"
+kind: standalone
+provides_tools:
+  - feishu_context_search
